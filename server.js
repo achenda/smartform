@@ -1,125 +1,134 @@
-//  OpenShift sample Node application
-var express = require('express'),
-    app     = express(),
-    morgan  = require('morgan');
-    
-Object.assign=require('object-assign')
+'use strict';
 
-app.engine('html', require('ejs').renderFile);
-app.use(morgan('combined'))
+/**
+ * This is the Form.io application server.
+ */
+const express = require('express');
+const nunjucks = require('nunjucks');
+const fs = require('fs-extra');
+const path = require('path');
+const util = require('./src/util/util');
+require('colors');
+const Q = require('q');
+const test = process.env.TEST_SUITE;
 
-var port = process.env.PORT || process.env.OPENSHIFT_NODEJS_PORT || 8080,
-    ip   = process.env.IP   || process.env.OPENSHIFT_NODEJS_IP || 'localhost',
-    mongoURL = process.env.OPENSHIFT_MONGODB_DB_URL || process.env.MONGO_URL,
-    mongoURLLabel = "";
+module.exports = function(options) {
+  options = options || {};
+  const q = Q.defer();
 
-if (mongoURL == null) {
-  var mongoHost, mongoPort, mongoDatabase, mongoPassword, mongoUser;
-  // If using plane old env vars via service discovery
-  if (process.env.DATABASE_SERVICE_NAME) {
-    var mongoServiceName = process.env.DATABASE_SERVICE_NAME.toUpperCase();
-    mongoHost = process.env[mongoServiceName + '_SERVICE_HOST'];
-    mongoPort = process.env[mongoServiceName + '_SERVICE_PORT'];
-    mongoDatabase = process.env[mongoServiceName + '_DATABASE'];
-    mongoPassword = process.env[mongoServiceName + '_PASSWORD'];
-    mongoUser = process.env[mongoServiceName + '_USER'];
-
-  // If using env vars from secret from service binding  
-  } else if (process.env.database_name) {
-    mongoDatabase = process.env.database_name;
-    mongoPassword = process.env.password;
-    mongoUser = process.env.username;
-    var mongoUriParts = process.env.uri && process.env.uri.split("//");
-    if (mongoUriParts.length == 2) {
-      mongoUriParts = mongoUriParts[1].split(":");
-      if (mongoUriParts && mongoUriParts.length == 2) {
-        mongoHost = mongoUriParts[0];
-        mongoPort = mongoUriParts[1];
-      }
-    }
-  }
-
-  if (mongoHost && mongoPort && mongoDatabase) {
-    mongoURLLabel = mongoURL = 'mongodb://';
-    if (mongoUser && mongoPassword) {
-      mongoURL += mongoUser + ':' + mongoPassword + '@';
-    }
-    // Provide UI label that excludes user id and pw
-    mongoURLLabel += mongoHost + ':' + mongoPort + '/' + mongoDatabase;
-    mongoURL += mongoHost + ':' +  mongoPort + '/' + mongoDatabase;
-  }
-}
-var db = null,
-    dbDetails = new Object();
-
-var initDb = function(callback) {
-  if (mongoURL == null) return;
-
-  var mongodb = require('mongodb');
-  if (mongodb == null) return;
-
-  mongodb.connect(mongoURL, function(err, conn) {
-    if (err) {
-      callback(err);
-      return;
-    }
-
-    db = conn;
-    dbDetails.databaseName = db.databaseName;
-    dbDetails.url = mongoURLLabel;
-    dbDetails.type = 'MongoDB';
-
-    console.log('Connected to MongoDB at: %s', mongoURL);
+  util.log('');
+  const rl = require('readline').createInterface({
+    input: require('fs').createReadStream('logo.txt')
   });
-};
 
-app.get('/', function (req, res) {
-  // try to initialize the db on every request if it's not already
-  // initialized.
-  if (!db) {
-    initDb(function(err){});
-  }
-  if (db) {
-    var col = db.collection('counts');
-    // Create a document with request IP and current time of request
-    col.insert({ip: req.ip, date: Date.now()});
-    col.count(function(err, count){
-      if (err) {
-        console.log('Error running count. Message:\n'+err);
+  rl.on('line', function(line) {
+    util.log(
+      line.substring(0,4) +
+      line.substring(4, 30).cyan.bold +
+      line.substring(30, 33) +
+      line.substring(33, 42).green.bold +
+      line.substring(42)
+    );
+  });
+
+  rl.on('close', function() {
+    // Print the welcome screen.
+    util.log('');
+    util.log(fs.readFileSync('welcome.txt').toString().green);
+  });
+
+  // Use the express application.
+  const app = options.app || express();
+
+  // Use the given config.
+  const config = options.config || require('config');
+
+  // Custom config for Openshift
+  const port = process.env.PORT || process.env.OPENSHIFT_NODEJS_PORT || config.port;
+  const ip   = process.env.IP   || process.env.OPENSHIFT_NODEJS_IP || 'localhost';
+
+  config.port = port;
+  config.host = (ip + ':' + port);
+  config.domain = ('https://' + config.host);
+  
+  // Configure nunjucks.
+  nunjucks.configure('client', {
+    autoescape: true,
+    express: app
+  });
+
+  // Mount the client application.
+  app.use('/', express.static(path.join(__dirname, '/client/dist')));
+
+  // Load the form.io server.
+  const server = options.server || require('./index')(config);
+  const hooks = options.hooks || {};
+
+  app.use(server.formio.middleware.restrictRequestTypes);
+  server.init(hooks).then(function(formio) {
+    // Called when we are ready to start the server.
+    const start = function() {
+      // Start the application.
+      if (fs.existsSync('app')) {
+        const application = express();
+        application.use('/', express.static(path.join(__dirname, '/app/dist')));
+        config.appPort = config.appPort || 8080;
+        application.listen(config.appPort);
+        const appHost = `http://localhost:${config.appPort}`;
+        util.log(` > Serving application at ${appHost.green}`);
       }
-      res.render('index.html', { pageCountMessage : count, dbInfo: dbDetails });
+
+      // Mount the Form.io API platform.
+      app.use(options.mount || '/', server);
+
+      // Allow tests access server internals.
+      app.formio = formio;
+
+      // Listen on the configured port.
+      return q.resolve({
+        server: app,
+        config: config
+      });
+    };
+
+    // Which items should be installed.
+    const install = {
+      download: false,
+      extract: false,
+      import: false,
+      user: false
+    };
+
+    // Check for the client folder.
+    if (!fs.existsSync('client') && !test) {
+      install.download = true;
+      install.extract = true;
+    }
+
+    // See if they have any forms available.
+    formio.db.collection('forms').estimatedDocumentCount(function(err, numForms) {
+      // If there are forms, then go ahead and start the server.
+      if ((!err && numForms > 0) || test) {
+        if (!install.download && !install.extract) {
+          return start();
+        }
+      }
+
+      // Import the project and create the user.
+      install.import = true;
+      install.user = true;
+
+      // Install.
+      require('./install')(formio, install, function(err) {
+        if (err) {
+          return util.log(err.message);
+        }
+
+        // Start the server.
+        start();
+      });
     });
-  } else {
-    res.render('index.html', { pageCountMessage : null});
-  }
-});
+  });
 
-app.get('/pagecount', function (req, res) {
-  // try to initialize the db on every request if it's not already
-  // initialized.
-  if (!db) {
-    initDb(function(err){});
-  }
-  if (db) {
-    db.collection('counts').count(function(err, count ){
-      res.send('{ pageCount: ' + count + '}');
-    });
-  } else {
-    res.send('{ pageCount: -1 }');
-  }
-});
-
-// error handling
-app.use(function(err, req, res, next){
-  console.error(err.stack);
-  res.status(500).send('Something bad happened!');
-});
-
-initDb(function(err){
-  console.log('Error connecting to Mongo. Message:\n'+err);
-});
-
-app.listen(port, ip);
-console.log('Server running on http://%s:%s', ip, port);
-
-module.exports = app ;
+  return q.promise;
+};
