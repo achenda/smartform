@@ -48,8 +48,8 @@ module.exports = function(options) {
   const ip   = process.env.IP   || process.env.OPENSHIFT_NODEJS_IP || 'localhost';
 
   config.port = port;
-  config.host = (ip + ':' + port);
-  config.domain = ('https://' + config.host);
+  config.host = process.env.OPENSHIFT_NODEJS_HOST || (ip + ':' + port);
+  config.domain = process.env.OPENSHIFT_NODEJS_DOMAIN || ('https://' + config.host);
   
   // Configure nunjucks.
   nunjucks.configure('client', {
